@@ -143,9 +143,7 @@ public struct BinaryProtocol {
 
         // Android's encoder rejects payloads above MAX_PAYLOAD_LENGTH; mirror it
         // so we never emit a packet whose expanded size every compliant decoder
-        // refuses. (The wire-size cap is a separate bound still enforced only at
-        // decode; incompressible payloads above maxFramedFileBytes still encode —
-        // see oversizedPayloadIsRejected.)
+        // refuses.
         guard packet.payload.count <= maxDecompressedPayloadBytes else {
             SecureLogger.warning("🚫 Refusing to encode payload of \(packet.payload.count) bytes above ceiling \(maxDecompressedPayloadBytes)", category: .security)
             return nil
@@ -185,6 +183,14 @@ public struct BinaryProtocol {
         let originalSizeFieldBytes = isCompressed ? lengthFieldBytes : 0
         // payloadLength in header is payload-only (does NOT include route bytes)
         let payloadDataSize = payload.count + originalSizeFieldBytes
+
+        // Fail fast at the sender: no compliant decoder accepts a wire frame
+        // above the framed-file cap, so emitting one only produces a silent
+        // drop at the receiver.
+        guard payloadDataSize <= FileTransferLimits.maxFramedFileBytes else {
+            SecureLogger.warning("🚫 Refusing to encode wire payload of \(payloadDataSize) bytes above framed cap \(FileTransferLimits.maxFramedFileBytes)", category: .security)
+            return nil
+        }
 
         if version == 1 && payloadDataSize > Int(UInt16.max) { return nil }
         if version == 2 && payloadDataSize > Int(UInt32.max) { return nil }

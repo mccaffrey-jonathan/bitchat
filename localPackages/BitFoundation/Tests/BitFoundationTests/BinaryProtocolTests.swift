@@ -346,8 +346,29 @@ struct BinaryProtocolTests {
             ttl: 1,
             version: 2
         )
-        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode oversized packet")
-        #expect(BinaryProtocol.decode(encoded) == nil)
+        // The encoder now fails fast instead of emitting a frame every
+        // compliant decoder rejects at the wire cap.
+        #expect(BinaryProtocol.encode(packet) == nil)
+    }
+
+    @Test("Wire frames declaring payloads above the framed cap are rejected on decode")
+    func oversizedWireFrameIsRejectedOnDecode() {
+        // Hand-crafted: our own encoder refuses such frames, a hostile peer
+        // does not. The full declared payload is present so only the wire-cap
+        // guard can reject it.
+        var data = Data()
+        data.append(2)                          // version
+        data.append(MessageType.message.rawValue)
+        data.append(1)                          // ttl
+        data.append(Data(repeating: 0, count: 8)) // timestamp
+        data.append(0x00)                       // flags: none
+        let payloadLength = UInt32(FileTransferLimits.maxFramedFileBytes + 1)
+        for shift in stride(from: 24, through: 0, by: -8) {
+            data.append(UInt8((payloadLength >> UInt32(shift)) & 0xFF))
+        }
+        data.append(Data(repeating: 0x01, count: 8)) // senderID
+        data.append(Data(repeating: 0x42, count: Int(payloadLength)))
+        #expect(BinaryProtocol.decode(data) == nil)
     }
 
     @Test("Decompressed ceiling stays pinned to the cross-platform protocol contract")
