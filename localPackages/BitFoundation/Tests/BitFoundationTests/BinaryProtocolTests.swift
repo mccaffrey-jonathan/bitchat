@@ -350,6 +350,20 @@ struct BinaryProtocolTests {
         #expect(BinaryProtocol.decode(encoded) == nil)
     }
 
+    @Test("Decompressed ceiling stays pinned to the cross-platform protocol contract")
+    func decompressedCeilingMatchesProtocolContract() {
+        // Android pins the same limit independently as
+        // AppConstants.Protocol.MAX_PAYLOAD_LENGTH (bitchat-android). If this
+        // assert fires you are changing the cross-platform wire contract:
+        // coordinate with the Android client instead of editing the expectation.
+        #expect(BinaryProtocol.maxDecompressedPayloadBytes == 10_485_760)
+        // The decompressed ceiling and the framed wire cap are defined
+        // independently; the ceiling must cover every frame the wire cap
+        // admits, or a payload that is legal uncompressed becomes illegal once
+        // compressed and is silently dropped again.
+        #expect(BinaryProtocol.maxDecompressedPayloadBytes >= FileTransferLimits.maxFramedFileBytes)
+    }
+
     @Test("Compressed payload expanding beyond the framed file cap decodes (Android parity)")
     func largeCompressedPayloadRoundTrip() throws {
         // Android's decompressed ceiling (AppConstants.Protocol.MAX_PAYLOAD_LENGTH)
