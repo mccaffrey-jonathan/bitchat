@@ -102,6 +102,11 @@ public struct BinaryProtocol {
     public static let senderIDSize = 8
     public static let recipientIDSize = 8
     public static let signatureSize = 64
+    /// Ceiling for the declared decompressed size of a compressed payload.
+    /// Must match Android's `AppConstants.Protocol.MAX_PAYLOAD_LENGTH` (10 MiB):
+    /// a lower value makes this client silently drop packets that other
+    /// clients legitimately produce.
+    public static let maxDecompressedPayloadBytes = 10 * 1024 * 1024
 
     // Field offsets within packet header
     public struct Offsets {
@@ -366,7 +371,10 @@ public struct BinaryProtocol {
                     guard let rawSize = read16() else { return nil }
                     originalSize = Int(rawSize)
                 }
-                guard originalSize >= 0 && originalSize <= FileTransferLimits.maxFramedFileBytes else { return nil }
+                guard originalSize >= 0 && originalSize <= maxDecompressedPayloadBytes else {
+                    SecureLogger.warning("🚫 Rejected compressed payload: declared decompressed size \(originalSize) exceeds ceiling \(maxDecompressedPayloadBytes)", category: .security)
+                    return nil
+                }
                 let compressedSize = payloadLength - lengthFieldBytes
                 guard compressedSize > 0, let compressed = readData(compressedSize) else { return nil }
 

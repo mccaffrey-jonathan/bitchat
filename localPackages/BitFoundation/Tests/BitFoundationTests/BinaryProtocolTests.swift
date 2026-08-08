@@ -349,7 +349,48 @@ struct BinaryProtocolTests {
         let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode oversized packet")
         #expect(BinaryProtocol.decode(encoded) == nil)
     }
-    
+
+    @Test("Compressed payload expanding beyond the framed file cap decodes (Android parity)")
+    func largeCompressedPayloadRoundTrip() throws {
+        // Android's decompressed ceiling (AppConstants.Protocol.MAX_PAYLOAD_LENGTH)
+        // is 10 MiB, so peers legitimately produce compressed packets whose
+        // expanded size exceeds FileTransferLimits.maxFramedFileBytes (~1.13 MiB).
+        let expandedSize = 2 * 1024 * 1024
+        #expect(expandedSize > FileTransferLimits.maxFramedFileBytes)
+        let payload = Data(repeating: 0xAB, count: expandedSize)
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode large compressible packet")
+        let decoded = try #require(BinaryProtocol.decode(encoded), "Large compressed payload within the decompressed ceiling must decode")
+        #expect(decoded.payload == payload)
+    }
+
+    @Test("Compressed payload declaring an expanded size above the decompressed ceiling is rejected")
+    func compressedPayloadAboveDecompressedCeilingIsRejected() throws {
+        let expandedSize = BinaryProtocol.maxDecompressedPayloadBytes + 1
+        let payload = Data(repeating: 0xAB, count: expandedSize)
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode over-ceiling compressible packet")
+        #expect(BinaryProtocol.decode(encoded) == nil)
+    }
+
     // MARK: - Message Padding Tests
     
     @Test func messagePadding() throws {
