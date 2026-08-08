@@ -105,7 +105,10 @@ public struct BinaryProtocol {
     /// Ceiling for the declared decompressed size of a compressed payload.
     /// Must match Android's `AppConstants.Protocol.MAX_PAYLOAD_LENGTH` (10 MiB):
     /// a lower value makes this client silently drop packets that other
-    /// clients legitimately produce.
+    /// clients legitimately produce. Accepting it means a ~10 KB frame can
+    /// legitimately expand into a retained 10 MiB payload — the exposure
+    /// Android already accepts; file payloads are re-validated against
+    /// FileTransferLimits downstream.
     public static let maxDecompressedPayloadBytes = 10 * 1024 * 1024
 
     // Field offsets within packet header
@@ -139,8 +142,10 @@ public struct BinaryProtocol {
         guard version == 1 || version == 2 else { return nil }
 
         // Android's encoder rejects payloads above MAX_PAYLOAD_LENGTH; mirror it
-        // so we never emit a packet that every compliant decoder — including our
-        // own decodeCore — refuses to expand.
+        // so we never emit a packet whose expanded size every compliant decoder
+        // refuses. (The wire-size cap is a separate bound still enforced only at
+        // decode; incompressible payloads above maxFramedFileBytes still encode —
+        // see oversizedPayloadIsRejected.)
         guard packet.payload.count <= maxDecompressedPayloadBytes else {
             SecureLogger.warning("🚫 Refusing to encode payload of \(packet.payload.count) bytes above ceiling \(maxDecompressedPayloadBytes)", category: .security)
             return nil

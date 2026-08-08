@@ -422,22 +422,25 @@ struct BinaryProtocolTests {
     }
 
     @Test("Compressed payload declaring an expanded size above the decompressed ceiling is rejected")
-    func compressedPayloadAboveDecompressedCeilingIsRejected() {
+    func compressedPayloadAboveDecompressedCeilingIsRejected() throws {
         // Hand-crafted because our own encoder now refuses to produce such a
-        // frame; a hostile peer still can.
+        // frame; a hostile peer still can. The compressed section is a real
+        // deflate stream (ratio ~1030:1, under the ratio guard) so only the
+        // ceiling check can reject this frame.
+        let original = Data(count: BinaryProtocol.maxDecompressedPayloadBytes + 1)
+        let compressed = try #require(CompressionUtil.compress(original), "Failed to deflate all-zero payload")
         var data = Data()
         data.append(2)                          // version
         data.append(MessageType.message.rawValue)
         data.append(1)                          // ttl
         data.append(Data(repeating: 0, count: 8)) // timestamp
         data.append(0x04)                       // flags: isCompressed
-        let compressed = Data([0x78, 0x9C, 0x01, 0x02]) // never inflated; guard fires first
         let payloadLength = UInt32(4 + compressed.count) // original-size field + compressed bytes
         for shift in stride(from: 24, through: 0, by: -8) {
             data.append(UInt8((payloadLength >> UInt32(shift)) & 0xFF))
         }
         data.append(Data(repeating: 0x01, count: 8)) // senderID
-        let declared = UInt32(BinaryProtocol.maxDecompressedPayloadBytes + 1)
+        let declared = UInt32(original.count)
         for shift in stride(from: 24, through: 0, by: -8) {
             data.append(UInt8((declared >> UInt32(shift)) & 0xFF))
         }
