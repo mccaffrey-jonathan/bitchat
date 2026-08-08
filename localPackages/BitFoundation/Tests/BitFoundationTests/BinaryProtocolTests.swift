@@ -387,10 +387,9 @@ struct BinaryProtocolTests {
         #expect(decoded.payload == payload)
     }
 
-    @Test("Compressed payload declaring an expanded size above the decompressed ceiling is rejected")
-    func compressedPayloadAboveDecompressedCeilingIsRejected() throws {
-        let expandedSize = BinaryProtocol.maxDecompressedPayloadBytes + 1
-        let payload = Data(repeating: 0xAB, count: expandedSize)
+    @Test("Payload at exactly the decompressed ceiling round-trips")
+    func payloadAtDecompressedCeilingRoundTrips() throws {
+        let payload = Data(repeating: 0xAB, count: BinaryProtocol.maxDecompressedPayloadBytes)
         let packet = BitchatPacket(
             type: MessageType.message.rawValue,
             senderID: Data(hexString: "0011223344556677") ?? Data(),
@@ -401,8 +400,49 @@ struct BinaryProtocolTests {
             ttl: 1,
             version: 2
         )
-        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode over-ceiling compressible packet")
-        #expect(BinaryProtocol.decode(encoded) == nil)
+        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode ceiling-sized packet")
+        let decoded = try #require(BinaryProtocol.decode(encoded), "Payload at the ceiling must decode")
+        #expect(decoded.payload == payload)
+    }
+
+    @Test("Encoder refuses payloads above the decompressed ceiling")
+    func encodeRejectsPayloadAboveDecompressedCeiling() {
+        let payload = Data(repeating: 0xAB, count: BinaryProtocol.maxDecompressedPayloadBytes + 1)
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        #expect(BinaryProtocol.encode(packet) == nil)
+    }
+
+    @Test("Compressed payload declaring an expanded size above the decompressed ceiling is rejected")
+    func compressedPayloadAboveDecompressedCeilingIsRejected() {
+        // Hand-crafted because our own encoder now refuses to produce such a
+        // frame; a hostile peer still can.
+        var data = Data()
+        data.append(2)                          // version
+        data.append(MessageType.message.rawValue)
+        data.append(1)                          // ttl
+        data.append(Data(repeating: 0, count: 8)) // timestamp
+        data.append(0x04)                       // flags: isCompressed
+        let compressed = Data([0x78, 0x9C, 0x01, 0x02]) // never inflated; guard fires first
+        let payloadLength = UInt32(4 + compressed.count) // original-size field + compressed bytes
+        for shift in stride(from: 24, through: 0, by: -8) {
+            data.append(UInt8((payloadLength >> UInt32(shift)) & 0xFF))
+        }
+        data.append(Data(repeating: 0x01, count: 8)) // senderID
+        let declared = UInt32(BinaryProtocol.maxDecompressedPayloadBytes + 1)
+        for shift in stride(from: 24, through: 0, by: -8) {
+            data.append(UInt8((declared >> UInt32(shift)) & 0xFF))
+        }
+        data.append(compressed)
+        #expect(BinaryProtocol.decode(data) == nil)
     }
 
     // MARK: - Message Padding Tests
@@ -767,7 +807,7 @@ struct BinaryProtocolTests {
 
         malformedData.append(0xFF)
         malformedData.append(0xFF)  // originalSize = 65535
-        malformedData.append(0x99)  // compressed payload length = 1 => ratio > 50_000
+        malformedData.append(0x99)  // compressed payload length = 1 => ratio 65,535:1, far above the guard
 
         #expect(BinaryProtocol.decode(malformedData) == nil)
     }

@@ -138,6 +138,14 @@ public struct BinaryProtocol {
         let version = packet.version
         guard version == 1 || version == 2 else { return nil }
 
+        // Android's encoder rejects payloads above MAX_PAYLOAD_LENGTH; mirror it
+        // so we never emit a packet that every compliant decoder — including our
+        // own decodeCore — refuses to expand.
+        guard packet.payload.count <= maxDecompressedPayloadBytes else {
+            SecureLogger.warning("🚫 Refusing to encode payload of \(packet.payload.count) bytes above ceiling \(maxDecompressedPayloadBytes)", category: .security)
+            return nil
+        }
+
         // Try to compress payload when beneficial, keeping original size for later decoding
         var payload = packet.payload
         var isCompressed = false
@@ -335,6 +343,10 @@ public struct BinaryProtocol {
             }
 
             guard payloadLength >= 0 else { return nil }
+            // Deliberately stricter than Android's 10 MiB wire bound: every local
+            // transport (BLE reassembly, Nostr ingest) already caps frames at this
+            // limit, so raising it is a per-peer memory decision that has to move
+            // together with those buffers.
             guard payloadLength <= FileTransferLimits.maxFramedFileBytes else { return nil }
 
             guard let senderID = readData(senderIDSize) else { return nil }
@@ -371,7 +383,7 @@ public struct BinaryProtocol {
                     guard let rawSize = read16() else { return nil }
                     originalSize = Int(rawSize)
                 }
-                guard originalSize >= 0 && originalSize <= maxDecompressedPayloadBytes else {
+                guard originalSize <= maxDecompressedPayloadBytes else {
                     SecureLogger.warning("🚫 Rejected compressed payload: declared decompressed size \(originalSize) exceeds ceiling \(maxDecompressedPayloadBytes)", category: .security)
                     return nil
                 }
@@ -379,7 +391,11 @@ public struct BinaryProtocol {
                 guard compressedSize > 0, let compressed = readData(compressedSize) else { return nil }
 
                 let compressionRatio = Double(originalSize) / Double(compressedSize)
-                guard compressionRatio <= 50_000.0 else {
+                // Deflate's format-level maximum is ~1032:1, so any higher declared
+                // ratio is forged. The old 50,000:1 bound let a ~210-byte frame
+                // demand a 10 MiB scratch buffer in decompress; this one caps the
+                // transient allocation a hostile frame can force.
+                guard compressionRatio <= 1_100.0 else {
                     SecureLogger.warning("🚫 Suspicious compression ratio: \(String(format: "%.0f", compressionRatio)):1", category: .security)
                     return nil
                 }
