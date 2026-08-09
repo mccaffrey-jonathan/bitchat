@@ -426,6 +426,35 @@ struct BinaryProtocolTests {
         #expect(decoded.payload == payload)
     }
 
+    @Test("Payload containing all 256 byte values still compresses to fit the wire cap")
+    func cyclicPayloadRoundTripsDespiteHeuristic() throws {
+        // shouldCompress divides a whole-payload unique-byte count by a sample
+        // size capped at 256, so this payload reads as incompressible even
+        // though deflate shrinks it ~1000x. Encode must compress it anyway:
+        // relayed or re-encoded copies of a legitimately received packet would
+        // otherwise die at the wire-cap guard.
+        let cycle = Data((0...255).map { UInt8($0) })
+        var payload = Data()
+        payload.reserveCapacity(2 * 1024 * 1024)
+        while payload.count < 2 * 1024 * 1024 {
+            payload.append(cycle)
+        }
+        #expect(!CompressionUtil.shouldCompress(payload))
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        let encoded = try #require(BinaryProtocol.encode(packet), "Over-cap compressible payload must encode via forced compression")
+        let decoded = try #require(BinaryProtocol.decode(encoded), "Forced-compression frame must decode")
+        #expect(decoded.payload == payload)
+    }
+
     @Test("Encoder refuses payloads above the decompressed ceiling")
     func encodeRejectsPayloadAboveDecompressedCeiling() {
         let payload = Data(repeating: 0xAB, count: BinaryProtocol.maxDecompressedPayloadBytes + 1)

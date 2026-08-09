@@ -11,21 +11,30 @@ final class GossipSyncManager {
         func getConnectedPeers() -> [PeerID]
     }
 
-    private struct PacketStore {
+    struct PacketStore {
         private(set) var packets: [String: BitchatPacket] = [:]
         private(set) var order: [String] = []
+        private(set) var totalPayloadBytes: Int = 0
 
-        mutating func insert(idHex: String, packet: BitchatPacket, capacity: Int) {
+        mutating func insert(idHex: String, packet: BitchatPacket, capacity: Int, byteBudget: Int) {
             guard capacity > 0 else { return }
-            if packets[idHex] != nil {
+            if let existing = packets[idHex] {
+                totalPayloadBytes += packet.payload.count - existing.payload.count
                 packets[idHex] = packet
-                return
+            } else {
+                packets[idHex] = packet
+                order.append(idHex)
+                totalPayloadBytes += packet.payload.count
             }
-            packets[idHex] = packet
-            order.append(idHex)
-            while order.count > capacity {
+            // Evict oldest-first past either bound. The byte budget matters
+            // since decode accepts payloads up to 10 MiB: without it, a burst
+            // of maximum-expansion frames could pin capacity × 10 MiB here
+            // from a few MB of wire traffic. Never evict the newest entry.
+            while order.count > 1 && (order.count > capacity || totalPayloadBytes > byteBudget) {
                 let victim = order.removeFirst()
-                packets.removeValue(forKey: victim)
+                if let removed = packets.removeValue(forKey: victim) {
+                    totalPayloadBytes -= removed.payload.count
+                }
             }
         }
 
@@ -42,6 +51,7 @@ final class GossipSyncManager {
                 guard let packet = packets[key] else { continue }
                 if shouldRemove(packet) {
                     packets.removeValue(forKey: key)
+                    totalPayloadBytes -= packet.payload.count
                 } else {
                     nextOrder.append(key)
                 }
@@ -62,6 +72,12 @@ final class GossipSyncManager {
 
     struct Config {
         var seenCapacity: Int = 1000          // max packets per sync (cap across types)
+        // Byte ceiling per packet store, alongside the per-store count caps.
+        // Decoded payloads can legitimately reach 10 MiB (Android parity), so
+        // count-only eviction would let a hostile burst pin count × 10 MiB;
+        // this bounds each store at a few ceiling-sized packets while staying
+        // far above what legitimate KB-scale mesh traffic accumulates.
+        var storeByteBudget: Int = 32 * 1024 * 1024
         var gcsMaxBytes: Int = 400           // filter size budget (128..1024)
         var gcsTargetFpr: Double = 0.01      // 1%
         var maxMessageAgeSeconds: TimeInterval = 900  // 15 min - fragments/files/announces
@@ -263,25 +279,25 @@ final class GossipSyncManager {
             guard isBroadcastRecipient else { return }
             guard isPacketFresh(packet) else { return }
             let idHex = PacketIdUtil.computeId(packet).hexEncodedString()
-            messages.insert(idHex: idHex, packet: packet, capacity: max(1, config.seenCapacity))
+            messages.insert(idHex: idHex, packet: packet, capacity: max(1, config.seenCapacity), byteBudget: config.storeByteBudget)
             archiveDirty = true
         case .fragment:
             guard isBroadcastRecipient else { return }
             guard isPacketFresh(packet) else { return }
             let idHex = PacketIdUtil.computeId(packet).hexEncodedString()
-            fragments.insert(idHex: idHex, packet: packet, capacity: max(1, config.fragmentCapacity))
+            fragments.insert(idHex: idHex, packet: packet, capacity: max(1, config.fragmentCapacity), byteBudget: config.storeByteBudget)
         case .fileTransfer:
             guard isBroadcastRecipient else { return }
             guard isPacketFresh(packet) else { return }
             let idHex = PacketIdUtil.computeId(packet).hexEncodedString()
-            fileTransfers.insert(idHex: idHex, packet: packet, capacity: max(1, config.fileTransferCapacity))
+            fileTransfers.insert(idHex: idHex, packet: packet, capacity: max(1, config.fileTransferCapacity), byteBudget: config.storeByteBudget)
         case .groupMessage:
             // Opaque ciphertext to non-members; carried and served like any
             // other broadcast so members get backfill from any relay.
             guard isBroadcastRecipient else { return }
             guard isPacketFresh(packet) else { return }
             let idHex = PacketIdUtil.computeId(packet).hexEncodedString()
-            groupMessages.insert(idHex: idHex, packet: packet, capacity: max(1, config.groupMessageCapacity))
+            groupMessages.insert(idHex: idHex, packet: packet, capacity: max(1, config.groupMessageCapacity), byteBudget: config.storeByteBudget)
         case .prekeyBundle:
             // Callers only feed verified bundles here (own bundles at send
             // time, peers' after signature verification), so gossip never
@@ -628,7 +644,7 @@ final class GossipSyncManager {
                   packet.type == MessageType.message.rawValue,
                   isPacketFresh(packet) else { continue }
             let idHex = PacketIdUtil.computeId(packet).hexEncodedString()
-            messages.insert(idHex: idHex, packet: packet, capacity: max(1, config.seenCapacity))
+            messages.insert(idHex: idHex, packet: packet, capacity: max(1, config.seenCapacity), byteBudget: config.storeByteBudget)
             restored += 1
         }
         if restored > 0 {

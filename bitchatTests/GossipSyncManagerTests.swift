@@ -6,7 +6,46 @@ import BitFoundation
 struct GossipSyncManagerTests {
 
     private let myPeerID = PeerID(str: "0102030405060708")
-    
+
+    @Test func packetStoreEvictsOldestPastByteBudget() throws {
+        var store = GossipSyncManager.PacketStore()
+        let senderID = try #require(Data(hexString: "1122334455667788"))
+        func packet(_ i: Int, payloadBytes: Int) -> BitchatPacket {
+            BitchatPacket(
+                type: MessageType.message.rawValue,
+                senderID: senderID,
+                recipientID: nil,
+                timestamp: 1_000_000 + UInt64(i),
+                payload: Data(repeating: UInt8(truncatingIfNeeded: i), count: payloadBytes),
+                signature: nil,
+                ttl: 1
+            )
+        }
+
+        // Count capacity alone would admit all of these; the byte budget must
+        // evict oldest-first once retained payload bytes exceed it.
+        let budget = 2048
+        for i in 0..<3 {
+            store.insert(idHex: "packet\(i)", packet: packet(i, payloadBytes: 1024), capacity: 10, byteBudget: budget)
+        }
+        #expect(store.order == ["packet1", "packet2"])
+        #expect(store.totalPayloadBytes == 2048)
+
+        // A single over-budget packet is still retained (never evict the
+        // newest entry), and replacing an entry re-accounts its bytes.
+        store.insert(idHex: "big", packet: packet(9, payloadBytes: 4096), capacity: 10, byteBudget: budget)
+        #expect(store.order == ["big"])
+        #expect(store.totalPayloadBytes == 4096)
+        store.insert(idHex: "big", packet: packet(9, payloadBytes: 512), capacity: 10, byteBudget: budget)
+        #expect(store.totalPayloadBytes == 512)
+
+        // remove(where:) keeps the byte accounting consistent.
+        store.insert(idHex: "small", packet: packet(3, payloadBytes: 256), capacity: 10, byteBudget: budget)
+        store.remove { $0.payload.count == 512 }
+        #expect(store.order == ["small"])
+        #expect(store.totalPayloadBytes == 256)
+    }
+
     @Test func concurrentPacketIntakeAndSyncRequest() async throws {
         let requestSyncManager = RequestSyncManager()
         let manager = GossipSyncManager(myPeerID: myPeerID, requestSyncManager: requestSyncManager)
