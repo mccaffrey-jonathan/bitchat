@@ -21,6 +21,12 @@ final class GossipSyncManager {
             if let existing = packets[idHex] {
                 totalPayloadBytes += packet.payload.count - existing.payload.count
                 packets[idHex] = packet
+                // A replacement is the newest write; refresh its position so
+                // the never-evict-the-newest invariant holds for it too.
+                if let index = order.firstIndex(of: idHex) {
+                    order.remove(at: index)
+                    order.append(idHex)
+                }
             } else {
                 packets[idHex] = packet
                 order.append(idHex)
@@ -78,6 +84,18 @@ final class GossipSyncManager {
         // this bounds each store at a few ceiling-sized packets while staying
         // far above what legitimate KB-scale mesh traffic accumulates.
         var storeByteBudget: Int = 32 * 1024 * 1024
+        // File-transfer backfill keeps a larger budget of its own: at the
+        // shared 32 MiB, the 200-entry capacity would bind at ~32 legit
+        // full-size files. 128 MiB preserves over half the backfill while
+        // still halving the pre-ceiling hostile worst case (200 × ~1.18 MiB).
+        var fileTransferByteBudget: Int = 128 * 1024 * 1024
+        // The announce and prekey maps key on identity rather than packet ID,
+        // so they carry their own bounds: a cap on distinct announce senders
+        // (senderID is unauthenticated and attacker-chosen), and a per-entry
+        // payload ceiling far above any legitimate KB-scale announce or
+        // prekey bundle but far below the 10 MiB decode ceiling.
+        var announceCapacity: Int = 500
+        var maxIdentityPacketBytes: Int = 64 * 1024
         var gcsMaxBytes: Int = 400           // filter size budget (128..1024)
         var gcsTargetFpr: Double = 0.01      // 1%
         var maxMessageAgeSeconds: TimeInterval = 900  // 15 min - fragments/files/announces
@@ -273,7 +291,16 @@ final class GossipSyncManager {
                 removeState(for: sender)
                 return
             }
+            // senderID is unauthenticated and attacker-chosen, so this map
+            // needs the same defenses the prekey branch applies below: a
+            // per-entry payload ceiling and a cap on distinct entries, with
+            // replacement of a known sender always allowed so the cap cannot
+            // block refreshes. Without them, each fabricated sender ID buys a
+            // retained entry of up to 10 MiB until the staleness sweep.
+            guard packet.payload.count <= config.maxIdentityPacketBytes else { return }
             let sender = PeerID(hexData: packet.senderID)
+            guard latestAnnouncementByPeer[sender] != nil
+                    || latestAnnouncementByPeer.count < max(1, config.announceCapacity) else { return }
             latestAnnouncementByPeer[sender] = packet
         case .message:
             guard isBroadcastRecipient else { return }
@@ -290,7 +317,7 @@ final class GossipSyncManager {
             guard isBroadcastRecipient else { return }
             guard isPacketFresh(packet) else { return }
             let idHex = PacketIdUtil.computeId(packet).hexEncodedString()
-            fileTransfers.insert(idHex: idHex, packet: packet, capacity: max(1, config.fileTransferCapacity), byteBudget: config.storeByteBudget)
+            fileTransfers.insert(idHex: idHex, packet: packet, capacity: max(1, config.fileTransferCapacity), byteBudget: config.fileTransferByteBudget)
         case .groupMessage:
             // Opaque ciphertext to non-members; carried and served like any
             // other broadcast so members get backfill from any relay.
@@ -304,6 +331,9 @@ final class GossipSyncManager {
             // spreads a bundle this node couldn't attribute.
             guard isBroadcastRecipient else { return }
             guard isPacketFresh(packet) else { return }
+            // Bundles are KB-scale; cap the stored payload so the owner-count
+            // cap below cannot be turned into count × 10 MiB retained bytes.
+            guard packet.payload.count <= config.maxIdentityPacketBytes else { return }
             // Key by the bundle's authenticated identity (its noise static key),
             // NOT the unauthenticated packet senderID. Otherwise one valid
             // bundle re-broadcast under many fabricated sender IDs would create
