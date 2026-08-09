@@ -1,9 +1,162 @@
 # Code review — PR #1: Accept compressed payloads up to Android's 10 MiB decompressed ceiling
 
+> **Two passes recorded.** [Pass 2](#pass-2--head-0c93fee) reviews the current head and supersedes pass 1;
+> pass 1 is kept below for the history of what was raised and how it was resolved.
+
+---
+
+# Pass 2 — head `0c93fee`
+
+**Target:** `claude/bitchat-top-5-issues-oqdx8h` → `main` (head `0c93fee`, base `1f59e81`)
+**Scope:** 4 files, +292/−33 — adds `GossipSyncManager.swift`, `GossipSyncManagerTests.swift`
+**Verdict:** Both pass-1 merge gates are genuinely fixed. The fixes introduce one new finding of comparable
+severity (#1 below) plus three smaller ones. Not yet mergeable, but closer.
+
+## Pass-1 findings: all four addressed
+
+| # | Pass-1 finding | Status |
+|---|---|---|
+| 1 | Count-capped `PacketStore` → ~10 GB retained | **Fixed** — `Config.storeByteBudget` (32 MiB per store), byte accounting maintained across insert/replace/remove, `packetStoreEvictsOldestPastByteBudget` covers it |
+| 2 | Re-encode black hole via `shouldCompress` heuristic | **Fixed** — `mustCompressToFit` forces compression when the frame can't otherwise fit the wire cap; `cyclicPayloadRoundTripsDespiteHeuristic` pins it |
+| 3 | Inaccurate "no compliant decoder accepts" comment | **Fixed** — now documented as necessary-not-sufficient, naming BLE's stricter 1 MiB non-file limit |
+| 4 | Rejection warning logged twice per frame | **Fixed** — `decodeCore(_:logRejections:)`, unpad retry suppressed |
+
+The `logRejections: false` suppression is safe: `decodeCore` ignores trailing padding, so the first pass is
+the meaningful one and the retry can only re-derive the same verdict.
+
+## New findings
+
+### 1. The byte budget stopped at `PacketStore`; `latestAnnouncementByPeer` is still unbounded (blocker)
+
+`GossipSyncManager.swift:277`
+
+The fix for pass-1 #1 bounded the four `PacketStore` instances. But announcements don't use `PacketStore` —
+they land in a plain dictionary with no count cap and no byte budget:
+
+```swift
+case .announce:
+    guard isPacketFresh(packet) else { return }
+    guard isAnnouncementFresh(packet) else { ... }
+    let sender = PeerID(hexData: packet.senderID)
+    latestAnnouncementByPeer[sender] = packet   // uncapped, retains full payload
+```
+
+The key is `packet.senderID` — **unauthenticated**, 8 bytes, attacker-chosen. Each fabricated sender ID
+creates a distinct entry retaining a payload of up to the new 10 MiB ceiling, evicted only when it falls out
+of the 60-second `stalePeerTimeoutSeconds` window.
+
+What makes this the clearest finding in the PR: the code immediately below it already diagnoses this exact
+attack for prekey bundles and defends against it —
+
+```swift
+// Key by the bundle's authenticated identity (its noise static key),
+// NOT the unauthenticated packet senderID. Otherwise one valid
+// bundle re-broadcast under many fabricated sender IDs would create
+// one cache entry each and exhaust the per-owner cap...
+```
+
+— and the announce path does neither the authenticated keying nor the cap. Before this PR the hole was
+bounded at ~1.13 MiB per entry; the ceiling raise multiplies it ~9×, which is the same reasoning that made
+pass-1 #1 a blocker.
+
+`latestPrekeyBundleByPeer` is a lesser case of the same gap: count-capped at `prekeyBundleCapacity = 200`
+(`GossipSyncManager.swift:105`) but with no byte budget, so 200 × 10 MiB ≈ 2 GB.
+
+*Suggested fix:* apply a byte budget to both maps, and cap announce entries the way prekeys already are.
+
+---
+
+### 2. `mustCompressToFit` widens the documented signing-canonicalization gap
+
+`BinaryProtocol.swift:163`
+
+The compression decision is part of the canonical signing bytes — `toBinaryDataForSigning` re-encodes, so
+verification reproduces the sender's compression choice locally. The PR body already documents this class of
+problem as pre-existing (upstream #933), and that framing is fair. Worth recording that this change widens it
+slightly rather than leaving it flat:
+
+```swift
+let mustCompressToFit = payload.count > FileTransferLimits.maxFramedFileBytes
+if CompressionUtil.shouldCompress(payload) || mustCompressToFit {
+```
+
+The decision now depends on `FileTransferLimits.maxFramedFileBytes` — a **locally computed** constant
+(it derives from `UInt16.max`-sized TLV metadata plus header sizes), not a value carried on the wire. Two
+peers that disagree on that constant now disagree on the canonical bytes for any payload between the two
+values. Previously the decision depended only on payload content, which at least made it derivable from data
+both sides hold.
+
+Practical exposure is small — old-code peers reject these frames at decode anyway — so this is a note for the
+#933 work, not a merge gate. It does mean `maxFramedFileBytes` is now load-bearing for signature validity and
+should not be tuned casually.
+
+---
+
+### 3. Forced compression makes a ~10 KB frame buy up to three 10 MiB codec passes
+
+`BinaryProtocol.swift:164`
+
+With the ceiling at 10 MiB and `mustCompressToFit` in place, one hostile ~10 KB frame at the newly permitted
+~1030:1 ratio costs the receiver one 10 MiB inflate, plus a 10 MiB **deflate** on the signature-verify
+re-encode and another on the relay re-encode. Deflate at 10 MiB is far more expensive than inflate, and
+`mustCompressToFit` means it can no longer be skipped for exactly these oversized payloads.
+
+The byte budget added in this revision bounds *retained memory*, which was the pass-1 concern, but does
+nothing for CPU. Sustained at link rate this is a plausible CPU-exhaustion path that was unreachable before
+the ceiling raise.
+
+---
+
+### 4. A single 32 MiB budget across all four stores silently shrinks file-transfer backfill
+
+`GossipSyncManager.swift:80`
+
+`storeByteBudget` is applied per store, but it's one value for four stores with very different entry sizes.
+`fileTransferCapacity` is 200, yet file payloads are validated at up to 1 MiB — so the byte budget binds
+first, at roughly 32 entries. Gossip backfill for file transfers drops ~6× on entirely ordinary traffic, with
+no log line marking the change.
+
+That may well be the right trade, but it should be a deliberate per-store number rather than a side effect of
+one shared constant.
+
+---
+
+### 5. Minor: the replace path doesn't refresh recency, so the newest-entry invariant can fail
+
+`GossipSyncManager.swift:22`
+
+The comment promises "Never evict the newest entry," and the loop guard `order.count > 1` implements that for
+insertions. But the replace branch updates `packets` and byte accounting without moving the key to the tail of
+`order`, so a replaced entry keeps its old position and can be evicted on the very next insert.
+
+Not reachable today: `PacketIdUtil.computeId` hashes the payload, so a replace always carries an identical
+payload and contributes no new eviction pressure. Worth fixing anyway now that `PacketStore` has been widened
+from `private` to internal and is directly unit-tested — the test doesn't cover this path.
+
+---
+
+### 6. Minor: rejection warnings remain unthrottled
+
+`BinaryProtocol.swift:411`
+
+The double-log is fixed, but a burst of malformed frames still writes to the security log at link rate. Same
+suggestion as pass 1: rate-limit.
+
+## Recommendation
+
+Resolve #1 (byte-bound `latestAnnouncementByPeer` and `latestPrekeyBundleByPeer`, and cap announces by
+authenticated identity as prekeys already are). Decide #4 deliberately. #2, #3, #5, #6 can be follow-ups, with
+#3 worth a tracking issue since it's a real consequence of the ceiling raise.
+
+---
+
+# Pass 1 — head `19c35b9`
+
 **Target:** `claude/bitchat-top-5-issues-oqdx8h` → `main` (head `19c35b9`, base `1f59e81`)
 **Scope:** 2 files, +160/−6 — `BinaryProtocol.swift`, `BinaryProtocolTests.swift`
 **Verdict:** Core change is correct and well-tested. Four findings below; #1 is a merge blocker, #2 is a
 correctness regression on the exact packets this PR sets out to admit.
+**Outcome:** all four addressed in `17d508d` / `0c93fee` — see the pass-2 table.
 
 ---
 
