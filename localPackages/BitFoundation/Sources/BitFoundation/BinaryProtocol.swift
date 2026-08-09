@@ -102,6 +102,14 @@ public struct BinaryProtocol {
     public static let senderIDSize = 8
     public static let recipientIDSize = 8
     public static let signatureSize = 64
+    /// Ceiling for the declared decompressed size of a compressed payload.
+    /// Must match Android's `AppConstants.Protocol.MAX_PAYLOAD_LENGTH` (10 MiB):
+    /// a lower value makes this client silently drop packets that other
+    /// clients legitimately produce. Accepting it means a ~10 KB frame can
+    /// legitimately expand into a retained 10 MiB payload — the exposure
+    /// Android already accepts; file payloads are re-validated against
+    /// FileTransferLimits downstream.
+    public static let maxDecompressedPayloadBytes = 10 * 1024 * 1024
 
     // Field offsets within packet header
     public struct Offsets {
@@ -133,11 +141,27 @@ public struct BinaryProtocol {
         let version = packet.version
         guard version == 1 || version == 2 else { return nil }
 
+        // Android's encoder rejects payloads above MAX_PAYLOAD_LENGTH; mirror it
+        // so we never emit a packet whose expanded size every compliant decoder
+        // refuses.
+        guard packet.payload.count <= maxDecompressedPayloadBytes else {
+            SecureLogger.warning("🚫 Refusing to encode payload of \(packet.payload.count) bytes above ceiling \(maxDecompressedPayloadBytes)", category: .security)
+            return nil
+        }
+
         // Try to compress payload when beneficial, keeping original size for later decoding
         var payload = packet.payload
         var isCompressed = false
         var originalPayloadSize: Int?
-        if CompressionUtil.shouldCompress(payload) {
+        // Compress when the heuristic approves — and regardless of the heuristic
+        // when the frame cannot fit the wire cap otherwise: shouldCompress
+        // divides a whole-payload unique-byte count by a sample size capped at
+        // 256, so any payload containing all 256 byte values reads as
+        // incompressible however repetitive it is, and for over-cap payloads
+        // declining compression means the framed-cap guard below emits nothing
+        // at all (breaking relay/re-encode of legitimately received packets).
+        let mustCompressToFit = payload.count > FileTransferLimits.maxFramedFileBytes
+        if CompressionUtil.shouldCompress(payload) || mustCompressToFit {
             // Only compress when we can represent the original length in the outbound frame
             let maxRepresentable = version == 2 ? Int(UInt32.max) : Int(UInt16.max)
             if payload.count <= maxRepresentable,
@@ -167,6 +191,16 @@ public struct BinaryProtocol {
         let originalSizeFieldBytes = isCompressed ? lengthFieldBytes : 0
         // payloadLength in header is payload-only (does NOT include route bytes)
         let payloadDataSize = payload.count + originalSizeFieldBytes
+
+        // Fail fast at the sender: no compliant decoder accepts a wire frame
+        // above the framed-file cap, so emitting one only produces a silent
+        // drop at the receiver. This bound is necessary, not sufficient —
+        // transports impose stricter per-type limits (BLE reassembly allows
+        // only 1 MiB for non-file packets; Nostr ingest caps whole frames).
+        guard payloadDataSize <= FileTransferLimits.maxFramedFileBytes else {
+            SecureLogger.warning("🚫 Refusing to encode wire payload of \(payloadDataSize) bytes above framed cap \(FileTransferLimits.maxFramedFileBytes)", category: .security)
+            return nil
+        }
 
         if version == 1 && payloadDataSize > Int(UInt16.max) { return nil }
         if version == 2 && payloadDataSize > Int(UInt32.max) { return nil }
@@ -256,14 +290,16 @@ public struct BinaryProtocol {
     public static func decode(_ data: Data) -> BitchatPacket? {
         // Try decode as-is first (robust when padding wasn't applied)
         if let pkt = decodeCore(data) { return pkt }
-        // If that fails, try after removing padding
+        // If that fails, try after removing padding. The retry re-parses the
+        // same frame, so rejection warnings stay silent here — otherwise every
+        // rejected frame would be logged twice.
         let unpadded = MessagePadding.unpad(data)
         if unpadded as NSData === data as NSData { return nil }
-        return decodeCore(unpadded)
+        return decodeCore(unpadded, logRejections: false)
     }
 
     // Core decoding implementation used by decode(_:) with and without padding removal
-    private static func decodeCore(_ raw: Data) -> BitchatPacket? {
+    private static func decodeCore(_ raw: Data, logRejections: Bool = true) -> BitchatPacket? {
         guard raw.count >= v1HeaderSize + senderIDSize else { return nil }
 
         return raw.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> BitchatPacket? in
@@ -330,6 +366,10 @@ public struct BinaryProtocol {
             }
 
             guard payloadLength >= 0 else { return nil }
+            // Deliberately stricter than Android's 10 MiB wire bound: every local
+            // transport (BLE reassembly, Nostr ingest) already caps frames at this
+            // limit, so raising it is a per-peer memory decision that has to move
+            // together with those buffers.
             guard payloadLength <= FileTransferLimits.maxFramedFileBytes else { return nil }
 
             guard let senderID = readData(senderIDSize) else { return nil }
@@ -366,13 +406,24 @@ public struct BinaryProtocol {
                     guard let rawSize = read16() else { return nil }
                     originalSize = Int(rawSize)
                 }
-                guard originalSize >= 0 && originalSize <= FileTransferLimits.maxFramedFileBytes else { return nil }
+                guard originalSize <= maxDecompressedPayloadBytes else {
+                    if logRejections {
+                        SecureLogger.warning("🚫 Rejected compressed payload: declared decompressed size \(originalSize) exceeds ceiling \(maxDecompressedPayloadBytes)", category: .security)
+                    }
+                    return nil
+                }
                 let compressedSize = payloadLength - lengthFieldBytes
                 guard compressedSize > 0, let compressed = readData(compressedSize) else { return nil }
 
                 let compressionRatio = Double(originalSize) / Double(compressedSize)
-                guard compressionRatio <= 50_000.0 else {
-                    SecureLogger.warning("🚫 Suspicious compression ratio: \(String(format: "%.0f", compressionRatio)):1", category: .security)
+                // Deflate's format-level maximum is ~1032:1, so any higher declared
+                // ratio is forged. The old 50,000:1 bound let a ~210-byte frame
+                // demand a 10 MiB scratch buffer in decompress; this one caps the
+                // transient allocation a hostile frame can force.
+                guard compressionRatio <= 1_100.0 else {
+                    if logRejections {
+                        SecureLogger.warning("🚫 Suspicious compression ratio: \(String(format: "%.0f", compressionRatio)):1", category: .security)
+                    }
                     return nil
                 }
 

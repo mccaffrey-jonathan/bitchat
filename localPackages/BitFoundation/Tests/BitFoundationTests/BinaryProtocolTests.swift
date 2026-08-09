@@ -324,18 +324,23 @@ struct BinaryProtocolTests {
 
     @Test("Reject payloads larger than the framed file cap")
     func oversizedPayloadIsRejected() throws {
+        // Genuinely incompressible bytes (deterministic SplitMix64 stream):
+        // encode force-compresses over-cap payloads, so a repetitive pattern
+        // would now legitimately shrink under the wire cap and encode. Only a
+        // payload deflate cannot shrink still exercises the fail-fast guard.
         let targetSize = FileTransferLimits.maxFramedFileBytes + 1
         var oversized = Data()
-        oversized.reserveCapacity(targetSize)
-        let byteRun = Data((0...255).map { UInt8($0) })
+        oversized.reserveCapacity(targetSize + 8)
+        var state: UInt64 = 0x9E3779B97F4A7C15
         while oversized.count < targetSize {
-            let remaining = targetSize - oversized.count
-            if remaining >= byteRun.count {
-                oversized.append(byteRun)
-            } else {
-                oversized.append(byteRun.prefix(remaining))
-            }
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            z ^= z >> 31
+            withUnsafeBytes(of: z.littleEndian) { oversized.append(contentsOf: $0) }
         }
+        oversized = Data(oversized.prefix(targetSize))
         let packet = BitchatPacket(
             type: MessageType.message.rawValue,
             senderID: Data(hexString: "0011223344556677") ?? Data(),
@@ -346,10 +351,158 @@ struct BinaryProtocolTests {
             ttl: 1,
             version: 2
         )
-        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode oversized packet")
-        #expect(BinaryProtocol.decode(encoded) == nil)
+        // The encoder now fails fast instead of emitting a frame every
+        // compliant decoder rejects at the wire cap.
+        #expect(BinaryProtocol.encode(packet) == nil)
     }
-    
+
+    @Test("Wire frames declaring payloads above the framed cap are rejected on decode")
+    func oversizedWireFrameIsRejectedOnDecode() {
+        // Hand-crafted: our own encoder refuses such frames, a hostile peer
+        // does not. The full declared payload is present so only the wire-cap
+        // guard can reject it.
+        var data = Data()
+        data.append(2)                          // version
+        data.append(MessageType.message.rawValue)
+        data.append(1)                          // ttl
+        data.append(Data(repeating: 0, count: 8)) // timestamp
+        data.append(0x00)                       // flags: none
+        let payloadLength = UInt32(FileTransferLimits.maxFramedFileBytes + 1)
+        for shift in stride(from: 24, through: 0, by: -8) {
+            data.append(UInt8((payloadLength >> UInt32(shift)) & 0xFF))
+        }
+        data.append(Data(repeating: 0x01, count: 8)) // senderID
+        data.append(Data(repeating: 0x42, count: Int(payloadLength)))
+        #expect(BinaryProtocol.decode(data) == nil)
+    }
+
+    @Test("Decompressed ceiling stays pinned to the cross-platform protocol contract")
+    func decompressedCeilingMatchesProtocolContract() {
+        // Android pins the same limit independently as
+        // AppConstants.Protocol.MAX_PAYLOAD_LENGTH (bitchat-android). If this
+        // assert fires you are changing the cross-platform wire contract:
+        // coordinate with the Android client instead of editing the expectation.
+        #expect(BinaryProtocol.maxDecompressedPayloadBytes == 10_485_760)
+        // The decompressed ceiling and the framed wire cap are defined
+        // independently; the ceiling must cover every frame the wire cap
+        // admits, or a payload that is legal uncompressed becomes illegal once
+        // compressed and is silently dropped again.
+        #expect(BinaryProtocol.maxDecompressedPayloadBytes >= FileTransferLimits.maxFramedFileBytes)
+    }
+
+    @Test("Compressed payload expanding beyond the framed file cap decodes (Android parity)")
+    func largeCompressedPayloadRoundTrip() throws {
+        // Android's decompressed ceiling (AppConstants.Protocol.MAX_PAYLOAD_LENGTH)
+        // is 10 MiB, so peers legitimately produce compressed packets whose
+        // expanded size exceeds FileTransferLimits.maxFramedFileBytes (~1.13 MiB).
+        let expandedSize = 2 * 1024 * 1024
+        #expect(expandedSize > FileTransferLimits.maxFramedFileBytes)
+        let payload = Data(repeating: 0xAB, count: expandedSize)
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode large compressible packet")
+        let decoded = try #require(BinaryProtocol.decode(encoded), "Large compressed payload within the decompressed ceiling must decode")
+        #expect(decoded.payload == payload)
+    }
+
+    @Test("Payload at exactly the decompressed ceiling round-trips")
+    func payloadAtDecompressedCeilingRoundTrips() throws {
+        let payload = Data(repeating: 0xAB, count: BinaryProtocol.maxDecompressedPayloadBytes)
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        let encoded = try #require(BinaryProtocol.encode(packet), "Failed to encode ceiling-sized packet")
+        let decoded = try #require(BinaryProtocol.decode(encoded), "Payload at the ceiling must decode")
+        #expect(decoded.payload == payload)
+    }
+
+    @Test("Payload containing all 256 byte values still compresses to fit the wire cap")
+    func cyclicPayloadRoundTripsDespiteHeuristic() throws {
+        // shouldCompress divides a whole-payload unique-byte count by a sample
+        // size capped at 256, so this payload reads as incompressible even
+        // though deflate shrinks it ~1000x. Encode must compress it anyway:
+        // relayed or re-encoded copies of a legitimately received packet would
+        // otherwise die at the wire-cap guard.
+        let cycle = Data((0...255).map { UInt8($0) })
+        var payload = Data()
+        payload.reserveCapacity(2 * 1024 * 1024)
+        while payload.count < 2 * 1024 * 1024 {
+            payload.append(cycle)
+        }
+        #expect(!CompressionUtil.shouldCompress(payload))
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        let encoded = try #require(BinaryProtocol.encode(packet), "Over-cap compressible payload must encode via forced compression")
+        let decoded = try #require(BinaryProtocol.decode(encoded), "Forced-compression frame must decode")
+        #expect(decoded.payload == payload)
+    }
+
+    @Test("Encoder refuses payloads above the decompressed ceiling")
+    func encodeRejectsPayloadAboveDecompressedCeiling() {
+        let payload = Data(repeating: 0xAB, count: BinaryProtocol.maxDecompressedPayloadBytes + 1)
+        let packet = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: "0011223344556677") ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 1,
+            version: 2
+        )
+        #expect(BinaryProtocol.encode(packet) == nil)
+    }
+
+    @Test("Compressed payload declaring an expanded size above the decompressed ceiling is rejected")
+    func compressedPayloadAboveDecompressedCeilingIsRejected() throws {
+        // Hand-crafted because our own encoder now refuses to produce such a
+        // frame; a hostile peer still can. The compressed section is a real
+        // deflate stream (ratio ~1030:1, under the ratio guard) so only the
+        // ceiling check can reject this frame.
+        let original = Data(count: BinaryProtocol.maxDecompressedPayloadBytes + 1)
+        let compressed = try #require(CompressionUtil.compress(original), "Failed to deflate all-zero payload")
+        var data = Data()
+        data.append(2)                          // version
+        data.append(MessageType.message.rawValue)
+        data.append(1)                          // ttl
+        data.append(Data(repeating: 0, count: 8)) // timestamp
+        data.append(0x04)                       // flags: isCompressed
+        let payloadLength = UInt32(4 + compressed.count) // original-size field + compressed bytes
+        for shift in stride(from: 24, through: 0, by: -8) {
+            data.append(UInt8((payloadLength >> UInt32(shift)) & 0xFF))
+        }
+        data.append(Data(repeating: 0x01, count: 8)) // senderID
+        let declared = UInt32(original.count)
+        for shift in stride(from: 24, through: 0, by: -8) {
+            data.append(UInt8((declared >> UInt32(shift)) & 0xFF))
+        }
+        data.append(compressed)
+        #expect(BinaryProtocol.decode(data) == nil)
+    }
+
     // MARK: - Message Padding Tests
     
     @Test func messagePadding() throws {
@@ -712,7 +865,7 @@ struct BinaryProtocolTests {
 
         malformedData.append(0xFF)
         malformedData.append(0xFF)  // originalSize = 65535
-        malformedData.append(0x99)  // compressed payload length = 1 => ratio > 50_000
+        malformedData.append(0x99)  // compressed payload length = 1 => ratio 65,535:1, far above the guard
 
         #expect(BinaryProtocol.decode(malformedData) == nil)
     }

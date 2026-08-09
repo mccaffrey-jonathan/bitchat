@@ -6,7 +6,113 @@ import BitFoundation
 struct GossipSyncManagerTests {
 
     private let myPeerID = PeerID(str: "0102030405060708")
-    
+
+    @Test func packetStoreEvictsOldestPastByteBudget() throws {
+        var store = GossipSyncManager.PacketStore()
+        let senderID = try #require(Data(hexString: "1122334455667788"))
+        func packet(_ i: Int, payloadBytes: Int) -> BitchatPacket {
+            BitchatPacket(
+                type: MessageType.message.rawValue,
+                senderID: senderID,
+                recipientID: nil,
+                timestamp: 1_000_000 + UInt64(i),
+                payload: Data(repeating: UInt8(truncatingIfNeeded: i), count: payloadBytes),
+                signature: nil,
+                ttl: 1
+            )
+        }
+
+        // Count capacity alone would admit all of these; the byte budget must
+        // evict oldest-first once retained payload bytes exceed it.
+        let budget = 2048
+        for i in 0..<3 {
+            store.insert(idHex: "packet\(i)", packet: packet(i, payloadBytes: 1024), capacity: 10, byteBudget: budget)
+        }
+        #expect(store.order == ["packet1", "packet2"])
+        #expect(store.totalPayloadBytes == 2048)
+
+        // A single over-budget packet is still retained (never evict the
+        // newest entry), and replacing an entry re-accounts its bytes.
+        store.insert(idHex: "big", packet: packet(9, payloadBytes: 4096), capacity: 10, byteBudget: budget)
+        #expect(store.order == ["big"])
+        #expect(store.totalPayloadBytes == 4096)
+        store.insert(idHex: "big", packet: packet(9, payloadBytes: 512), capacity: 10, byteBudget: budget)
+        #expect(store.totalPayloadBytes == 512)
+
+        // remove(where:) keeps the byte accounting consistent.
+        store.insert(idHex: "small", packet: packet(3, payloadBytes: 256), capacity: 10, byteBudget: budget)
+        store.remove { $0.payload.count == 512 }
+        #expect(store.order == ["small"])
+        #expect(store.totalPayloadBytes == 256)
+    }
+
+    @Test func packetStoreReplaceRefreshesRecency() throws {
+        var store = GossipSyncManager.PacketStore()
+        let senderID = try #require(Data(hexString: "1122334455667788"))
+        func packet(_ i: Int) -> BitchatPacket {
+            BitchatPacket(
+                type: MessageType.message.rawValue,
+                senderID: senderID,
+                recipientID: nil,
+                timestamp: 1_000_000 + UInt64(i),
+                payload: Data(repeating: UInt8(truncatingIfNeeded: i), count: 1024),
+                signature: nil,
+                ttl: 1
+            )
+        }
+        let budget = 2048
+        store.insert(idHex: "a", packet: packet(0), capacity: 10, byteBudget: budget)
+        store.insert(idHex: "b", packet: packet(1), capacity: 10, byteBudget: budget)
+        // Replacing "a" makes it the newest write; the next over-budget
+        // insert must evict "b", not the freshly replaced "a".
+        store.insert(idHex: "a", packet: packet(2), capacity: 10, byteBudget: budget)
+        store.insert(idHex: "c", packet: packet(3), capacity: 10, byteBudget: budget)
+        #expect(store.order == ["a", "c"])
+        #expect(store.totalPayloadBytes == 2048)
+    }
+
+    @Test func announceMapEnforcesPayloadCeilingAndSenderCap() throws {
+        var config = GossipSyncManager.Config()
+        config.announceCapacity = 2
+
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: requestSyncManager)
+
+        func announce(senderHex: String, payloadBytes: Int) throws -> BitchatPacket {
+            BitchatPacket(
+                type: MessageType.announce.rawValue,
+                senderID: try #require(Data(hexString: senderHex)),
+                recipientID: nil,
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: Data(repeating: 0x41, count: payloadBytes),
+                signature: nil,
+                ttl: 1
+            )
+        }
+
+        // Oversized payload from a fresh sender is rejected outright: sender
+        // IDs are unauthenticated, so each stored entry must stay KB-scale.
+        let oversized = try announce(senderHex: "00000000000000AA", payloadBytes: config.maxIdentityPacketBytes + 1)
+        manager.onPublicPacketSeen(oversized)
+        #expect(!manager._hasAnnouncement(for: PeerID(hexData: oversized.senderID)))
+
+        // Distinct senders fill the cap; the one past it is rejected.
+        let first = try announce(senderHex: "0000000000000001", payloadBytes: 64)
+        let second = try announce(senderHex: "0000000000000002", payloadBytes: 64)
+        let third = try announce(senderHex: "0000000000000003", payloadBytes: 64)
+        manager.onPublicPacketSeen(first)
+        manager.onPublicPacketSeen(second)
+        manager.onPublicPacketSeen(third)
+        #expect(manager._hasAnnouncement(for: PeerID(hexData: first.senderID)))
+        #expect(manager._hasAnnouncement(for: PeerID(hexData: second.senderID)))
+        #expect(!manager._hasAnnouncement(for: PeerID(hexData: third.senderID)))
+
+        // Replacing a known sender is still allowed at the cap.
+        let firstRefresh = try announce(senderHex: "0000000000000001", payloadBytes: 128)
+        manager.onPublicPacketSeen(firstRefresh)
+        #expect(manager._hasAnnouncement(for: PeerID(hexData: first.senderID)))
+    }
+
     @Test func concurrentPacketIntakeAndSyncRequest() async throws {
         let requestSyncManager = RequestSyncManager()
         let manager = GossipSyncManager(myPeerID: myPeerID, requestSyncManager: requestSyncManager)
