@@ -324,18 +324,23 @@ struct BinaryProtocolTests {
 
     @Test("Reject payloads larger than the framed file cap")
     func oversizedPayloadIsRejected() throws {
+        // Genuinely incompressible bytes (deterministic SplitMix64 stream):
+        // encode force-compresses over-cap payloads, so a repetitive pattern
+        // would now legitimately shrink under the wire cap and encode. Only a
+        // payload deflate cannot shrink still exercises the fail-fast guard.
         let targetSize = FileTransferLimits.maxFramedFileBytes + 1
         var oversized = Data()
-        oversized.reserveCapacity(targetSize)
-        let byteRun = Data((0...255).map { UInt8($0) })
+        oversized.reserveCapacity(targetSize + 8)
+        var state: UInt64 = 0x9E3779B97F4A7C15
         while oversized.count < targetSize {
-            let remaining = targetSize - oversized.count
-            if remaining >= byteRun.count {
-                oversized.append(byteRun)
-            } else {
-                oversized.append(byteRun.prefix(remaining))
-            }
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            z ^= z >> 31
+            withUnsafeBytes(of: z.littleEndian) { oversized.append(contentsOf: $0) }
         }
+        oversized = Data(oversized.prefix(targetSize))
         let packet = BitchatPacket(
             type: MessageType.message.rawValue,
             senderID: Data(hexString: "0011223344556677") ?? Data(),
