@@ -17,6 +17,8 @@ default:
     @echo "  just clean              Remove repo-local build artifacts only"
     @echo "  just nuke               Also remove nested package build caches"
     @echo "  just check              Validate the development environment"
+    @echo "  just audit              Security-sweep the crypto and transport core"
+    @echo "  just audit-all          Security-sweep every source file"
 
 # Static guard against reintroducing source-restoring or source-deleting clean
 # behavior. CI runs the same script directly.
@@ -59,6 +61,15 @@ nuke: clean
     @find localPackages -type d -name .build -prune -exec rm -rf -- {} +
     @rm -rf -- ".cache"
     @echo "✅ Removed repository build caches; tracked files were untouched"
+
+# opencode review of each file against docs/SECURITY-CHECKLIST.md.
+# Needs OPENROUTER_API_KEY; see docs/OPENCODE-SETUP.md. Read-only — the agent
+# has no write tool and the sweep never touches the working tree.
+audit *ARGS:
+    @bash scripts/security-sweep.sh --filter 'bitchat/(Noise|Nostr|Identity|Protocols|Sync)' {{ARGS}}
+
+audit-all *ARGS:
+    @bash scripts/security-sweep.sh {{ARGS}}
 
 info:
     @echo "BitChat - decentralized mesh messaging"

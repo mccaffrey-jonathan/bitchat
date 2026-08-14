@@ -1,0 +1,40 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openrouter": {
+      "npm": "@openrouter/ai-sdk-provider",
+      "name": "OpenRouter",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "{env:OPENROUTER_API_KEY}",
+        "headers": {
+          "HTTP-Referer": "https://github.com/permissionlesstech/bitchat",
+          "X-Title": "bitchat security sweep"
+        }
+      },
+      "models": {
+        "z-ai/glm-5.3": {
+          "name": "GLM 5.3"
+        }
+      }
+    }
+  },
+  "model": "openrouter/z-ai/glm-5.3",
+  "small_model": "openrouter/z-ai/glm-5.3",
+  "autoupdate": false,
+  "instructions": [
+    "docs/SECURITY-CHECKLIST.md"
+  ],
+  "permission": {
+    "edit": "deny",
+    "bash": {
+      "*": "deny",
+      "git log *": "allow",
+      "git show *": "allow",
+      "git blame *": "allow",
+      "rg *": "allow",
+      "grep *": "allow"
+    },
+    "webfetch": "deny"
+  }
+}
